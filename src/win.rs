@@ -15,7 +15,6 @@ use tokio::prelude::*;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::path::Path;
-use std::mem::MaybeUninit;
 use tokio::io::PollEvented;
 
 type NamedPipe = PollEvented<mio_named_pipes::NamedPipe>;
@@ -178,15 +177,11 @@ impl Connection {
 }
 
 impl AsyncRead for Connection {
-    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [MaybeUninit<u8>]) -> bool {
-        self.inner.prepare_uninitialized_buffer(buf)
-    }
-
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = Pin::into_inner(self);
         Pin::new(&mut this.inner).poll_read(ctx, buf)
     }
