@@ -1,7 +1,7 @@
 use tokio::{self, io::*};
 use parity_tokio_ipc::Endpoint;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
 	let path = std::env::args().nth(1).expect("Run it with server path to connect as argument");
 

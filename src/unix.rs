@@ -2,6 +2,7 @@ use libc::chmod;
 use std::ffi::CString;
 use std::io::{self, Error};
 use tokio::io::*;
+use futures::Stream;
 use tokio::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::pin::Pin;
@@ -14,16 +15,17 @@ pub struct SecurityAttributes {
 }
 
 impl SecurityAttributes {
-    /// New default security attributes.
+    /// New default security attributes. These only allow access by the
+    /// process’s own user and the system administrator.
     pub fn empty() -> Self {
         SecurityAttributes {
-            mode: None
+            mode: Some(0o600)
         }
     }
 
     /// New security attributes that allow everyone to connect.
     pub fn allow_everyone_connect(mut self) -> io::Result<Self> {
-        self.mode = Some(0o777);
+        self.mode = Some(0o666);
         Ok(self)
     }
 
@@ -34,6 +36,9 @@ impl SecurityAttributes {
     }
 
     /// New security attributes that allow everyone to create.
+    ///
+    /// This does not work on unix, where it is equivalent to
+    /// [`SecurityAttributes::allow_everyone_connect`].
     pub fn allow_everyone_create() -> io::Result<Self> {
         Ok(SecurityAttributes {
             mode: None
@@ -42,11 +47,11 @@ impl SecurityAttributes {
 
     /// called in unix, after server socket has been created
     /// will apply security attributes to the socket.
-     pub(crate) unsafe fn apply_permissions(&self, path: &str) -> io::Result<()> {
-        let path = CString::new(path.to_owned())?;
-         if let Some(mode) = self.mode {
-            if chmod(path.as_ptr(), mode as _) == -1 {
-                return Err(Error::last_os_error())
+    fn apply_permissions(&self, path: &str) -> io::Result<()> {
+        if let Some(mode) = self.mode {
+            let path = CString::new(path)?;
+            if unsafe { chmod(path.as_ptr(), mode.into()) } == -1 {
+                return Err(Error::last_os_error());
             }
         }
 
@@ -60,29 +65,17 @@ pub struct Endpoint {
     security_attributes: SecurityAttributes,
 }
 
-pub struct Incoming {
-    socket: UnixListener,
-}
-
-impl Incoming {
-    pub async fn next(&mut self) -> Option<io::Result<Connection>> {
-        match self.socket.accept().await {
-            Ok((stream, _)) => Some(Ok(Connection::wrap(stream))),
-            Err(err) => Some(Err(err))
-        }
-    }
-}
-
 impl Endpoint {
     /// Stream of incoming connections
-    pub fn incoming(&mut self) -> io::Result<Incoming> {
-        unsafe {
-            // the call to bind in `inner()` creates the file
-            // `apply_permission()` will set the file permissions.
-            self.security_attributes.apply_permissions(&self.path)?;
-        };
-        let socket = self.inner()?;
-        Ok(Incoming { socket })
+    pub fn incoming(self) -> io::Result<impl Stream<Item = std::io::Result<impl AsyncRead + AsyncWrite>> + 'static> {
+        let listener = self.inner()?;
+        // the call to bind in `inner()` creates the file
+        // `apply_permission()` will set the file permissions.
+        self.security_attributes.apply_permissions(&self.path)?;
+        Ok(Incoming {
+            path: self.path,
+            listener,
+        })
     }
 
     /// Inner platform-dependant state of the endpoint
@@ -114,6 +107,38 @@ impl Endpoint {
     }
 }
 
+/// Stream of incoming connections.
+///
+/// Removes the bound socket file when dropped.
+pub struct Incoming {
+    path: String,
+    listener: UnixListener,
+}
+
+impl Stream for Incoming {
+    type Item = io::Result<UnixStream>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = Pin::into_inner(self);
+        match Pin::new(&mut this.listener).poll_accept(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(Some(result.map(|(stream, _addr)| stream))),
+        }
+    }
+}
+
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        use std::fs;
+        if let Ok(()) = fs::remove_file(&self.path) {
+            log::trace!("Removed socket file at: {}", self.path)
+        }
+    }
+}
+
 /// IPC connection.
 pub struct Connection {
     inner: UnixStream,
@@ -129,7 +154,7 @@ impl AsyncRead for Connection {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = Pin::into_inner(self);
         Pin::new(&mut this.inner).poll_read(ctx, buf)

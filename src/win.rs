@@ -1,4 +1,4 @@
-use winapi::shared::winerror::ERROR_SUCCESS;
+use winapi::shared::winerror::{ERROR_PIPE_BUSY, ERROR_SUCCESS};
 use winapi::um::accctrl::*;
 use winapi::um::aclapi::*;
 use winapi::um::minwinbase::{LPTR, PSECURITY_ATTRIBUTES, SECURITY_ATTRIBUTES};
@@ -6,20 +6,31 @@ use winapi::um::securitybaseapi::*;
 use winapi::um::winbase::{LocalAlloc, LocalFree};
 use winapi::um::winnt::*;
 
+use futures::Stream;
 use std::io;
 use std::marker;
 use std::mem;
 use std::path::Path;
+use std::pin::Pin;
 use std::ptr;
-use tokio::net::windows::named_pipe::*;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-pub type ConnectionClient = NamedPipeClient;
-pub type Connection = NamedPipeServer;
+use tokio::net::windows::named_pipe;
+
+enum NamedPipe {
+    Server(named_pipe::NamedPipeServer),
+    Client(named_pipe::NamedPipeClient),
+}
+
+const PIPE_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Endpoint implementation for windows
 pub struct Endpoint {
     path: String,
     security_attributes: SecurityAttributes,
+    created_listener: bool,
 }
 
 fn create_server(path: &str, first: bool, attr: *mut libc::c_void) -> io::Result<NamedPipeServer> {
@@ -36,21 +47,42 @@ fn create_server(path: &str, first: bool, attr: *mut libc::c_void) -> io::Result
 
 impl Endpoint {
     /// Stream of incoming connections
-    pub fn incoming(mut self) -> io::Result<Incoming> {
-        let pipe = self.inner()?;
-        Ok(Incoming {
-            path: self.path.clone(),
-            inner: NamedPipeSupport {
-                path: self.path,
-                pipe,
-                security_attributes: self.security_attributes,
-            },
-        })
+    pub fn incoming(
+        mut self,
+    ) -> io::Result<impl Stream<Item = io::Result<impl AsyncRead + AsyncWrite>> + 'static> {
+        let pipe = self.create_listener()?;
+
+        let stream =
+            futures::stream::try_unfold((pipe, self), |(listener, mut endpoint)| async move {
+                let () = listener.connect().await?;
+
+                let new_listener = endpoint.create_listener()?;
+
+                let conn = Connection::wrap(NamedPipe::Server(listener));
+
+                Ok(Some((conn, (new_listener, endpoint))))
+            });
+
+        Ok(stream)
     }
 
-    /// Inner platform-dependant state of the endpoint
-    fn inner(&mut self) -> io::Result<NamedPipeServer> {
-        unsafe { create_server(&self.path, true, self.security_attributes.as_ptr() as _) }
+    fn create_listener(&mut self) -> io::Result<named_pipe::NamedPipeServer> {
+        let server = unsafe {
+            named_pipe::ServerOptions::new()
+                .first_pipe_instance(!self.created_listener)
+                .reject_remote_clients(true)
+                .access_inbound(true)
+                .access_outbound(true)
+                .in_buffer_size(65536)
+                .out_buffer_size(65536)
+                .create_with_security_attributes_raw(
+                    &self.path,
+                    self.security_attributes.as_ptr() as *mut libc::c_void,
+                )
+        }?;
+        self.created_listener = true;
+
+        Ok(server)
     }
 
     /// Set security attributes for the connection
@@ -64,25 +96,32 @@ impl Endpoint {
     }
 
     /// Make new connection using the provided path and running event pool.
-    pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<ConnectionClient> {
-        Self::connect_inner(path.as_ref()).await
-    }
+    pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Connection> {
+        let path = path.as_ref();
 
-    async fn connect_inner(path: &Path) -> io::Result<NamedPipeClient> {
+        // There is not async equivalent of waiting for a named pipe in Windows,
+        // so we keep trying or sleeping for a bit, until we hit a timeout
+        let attempt_start = Instant::now();
         let client = loop {
-            match ClientOptions::new().read(true).write(true).open(path) {
+            match named_pipe::ClientOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
                 Ok(client) => break client,
-                Err(e)
-                    if e.raw_os_error()
-                        == Some(winapi::shared::winerror::ERROR_PIPE_BUSY as i32) =>
-                {
-                    ()
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    if attempt_start.elapsed() < PIPE_AVAILABILITY_TIMEOUT {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
                 }
                 Err(e) => return Err(e),
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         };
-        Ok(client)
+
+        Ok(Connection::wrap(NamedPipe::Client(client)))
     }
 
     /// New IPC endpoint at the given path
@@ -90,37 +129,64 @@ impl Endpoint {
         Endpoint {
             path,
             security_attributes: SecurityAttributes::empty(),
+            created_listener: false,
         }
     }
 }
 
-struct NamedPipeSupport {
-    path: String,
-    pipe: NamedPipeServer,
-    security_attributes: SecurityAttributes,
+/// IPC connection.
+pub struct Connection {
+    inner: NamedPipe,
 }
 
-/// Stream of incoming connections
-pub struct Incoming {
-    #[allow(dead_code)]
-    path: String,
-    inner: NamedPipeSupport,
-}
-
-impl Incoming {
-    async fn next_(&mut self) -> io::Result<NamedPipeServer> {
-        self.inner.pipe.connect().await?;
-        let new_listener = unsafe {
-            create_server(
-                &self.inner.path,
-                false,
-                self.inner.security_attributes.as_ptr() as _,
-            )?
-        };
-        Ok(std::mem::replace(&mut self.inner.pipe, new_listener))
+impl Connection {
+    /// Wraps an existing named pipe
+    fn wrap(pipe: NamedPipe) -> Self {
+        Self { inner: pipe }
     }
-    pub async fn next(&mut self) -> Option<io::Result<NamedPipeServer>> {
-        Some(self.next_().await)
+}
+
+impl AsyncRead for Connection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = Pin::into_inner(self);
+        match this.inner {
+            NamedPipe::Client(ref mut c) => Pin::new(c).poll_read(ctx, buf),
+            NamedPipe::Server(ref mut s) => Pin::new(s).poll_read(ctx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Connection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = Pin::into_inner(self);
+        match this.inner {
+            NamedPipe::Client(ref mut c) => Pin::new(c).poll_write(ctx, buf),
+            NamedPipe::Server(ref mut s) => Pin::new(s).poll_write(ctx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = Pin::into_inner(self);
+        match this.inner {
+            NamedPipe::Client(ref mut c) => Pin::new(c).poll_flush(ctx),
+            NamedPipe::Server(ref mut s) => Pin::new(s).poll_flush(ctx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = Pin::into_inner(self);
+        match this.inner {
+            NamedPipe::Client(ref mut c) => Pin::new(c).poll_shutdown(ctx),
+            NamedPipe::Server(ref mut s) => Pin::new(s).poll_shutdown(ctx),
+        }
     }
 }
 
@@ -129,10 +195,26 @@ pub struct SecurityAttributes {
     attributes: Option<InnerAttributes>,
 }
 
+pub const DEFAULT_SECURITY_ATTRIBUTES: SecurityAttributes = SecurityAttributes {
+    attributes: Some(InnerAttributes {
+        descriptor: SecurityDescriptor {
+            descriptor_ptr: ptr::null_mut(),
+        },
+        acl: Acl {
+            acl_ptr: ptr::null_mut(),
+        },
+        attrs: SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 0,
+        },
+    }),
+};
+
 impl SecurityAttributes {
     /// New default security attributes.
     pub fn empty() -> SecurityAttributes {
-        SecurityAttributes { attributes: None }
+        DEFAULT_SECURITY_ATTRIBUTES
     }
 
     /// New default security attributes that allow everyone to connect.
@@ -177,6 +259,7 @@ impl Sid {
         let mut sid_ptr = ptr::null_mut();
         #[allow(const_item_mutation)]
         let result = unsafe {
+            #[allow(const_item_mutation)]
             AllocateAndInitializeSid(
                 SECURITY_WORLD_SID_AUTHORITY.as_mut_ptr() as *mut _,
                 1,

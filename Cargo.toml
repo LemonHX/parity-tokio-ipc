@@ -1,12 +1,12 @@
 [package]
 name = "parity-tokio-ipc"
-version = "0.8"
-edition = "2018"
+version = "0.9.0"
+edition = "2021"
 authors = ["NikVolf <nikvolf@gmail.com>", "LemonHX <lemonhx@lemonhx.tech>"]
 license = "MIT/Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/nikvolf/parity-tokio-ipc"
-homepage = "https://github.com/nikvolf/parity-tokio-ipc"
+repository = "https://github.com/paritytech/parity-tokio-ipc"
+homepage = "https://github.com/paritytech/parity-tokio-ipc"
 description = """
 Interprocess communication library for tokio.
 """
@@ -17,7 +17,7 @@ log = "0.4"
 mio-named-pipes = "0.1"
 miow = "0.4"
 rand = "0.8"
-tokio = { version = "1.17", features = ["full"] }
+tokio = { version = "^1", features = ["full"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

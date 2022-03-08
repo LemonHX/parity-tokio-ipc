@@ -4,6 +4,18 @@
 //#![warn(missing_docs)]
 //#![deny(rust_2018_idioms)]
 
+// Use this directly once Rust 1.54 is stabilized; for some reason going
+// indirectly through a macro is okay.
+// See https://github.com/rust-lang/rust/issues/78835
+macro_rules! doc_comment {
+    ($x:expr) => {
+        #[doc = $x]
+        extern {}
+    };
+}
+
+doc_comment!(include_str!("../README.md"));
+
 #[cfg(windows)]
 mod win;
 #[cfg(not(windows))]
@@ -47,15 +59,12 @@ pub fn dummy_endpoint() -> String {
 
 #[cfg(test)]
 mod tests {
-	use futures::{channel::oneshot, FutureExt as _};
+	use futures::{channel::oneshot, StreamExt as _, FutureExt as _};
 	use std::time::Duration;
 	use tokio::{
 		self,
-		io::split,
+		io::*,
 	};
-	use tokio::io::AsyncWriteExt;
-	use tokio::io::AsyncReadExt;
-
 	use super::{dummy_endpoint, Endpoint, SecurityAttributes};
 	use std::path::Path;
 	use futures::future::{Either, select, ready};
@@ -69,7 +78,8 @@ mod tests {
 				.set_mode(0o777)
 				.unwrap()
 		);
-		let mut incoming = endpoint.incoming().expect("failed to open up a new socket");
+		let incoming = endpoint.incoming().expect("failed to open up a new socket");
+		futures::pin_mut!(incoming);
 
 		while let Some(result) = incoming.next().await {
 			match result {
@@ -131,7 +141,16 @@ mod tests {
 			// assert that it has
 			assert!(!path.exists());
 		}
-	}
+    }
+
+    #[tokio::test]
+    async fn incoming_stream_is_static() {
+        fn is_static<T: 'static>(_: T) {}
+
+        let path = dummy_endpoint();
+        let endpoint = Endpoint::new(path);
+        is_static(endpoint.incoming());
+    }
 
 	#[cfg(windows)]
 	fn create_pipe_with_permissions(attr: SecurityAttributes) -> ::std::io::Result<()> {
